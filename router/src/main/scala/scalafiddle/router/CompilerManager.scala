@@ -40,10 +40,16 @@ class CompilerManager extends Actor with ActorLogging {
   override def preStart(): Unit = {
     super.preStart()
     // try to load libraries
-    currentLibs = loadLibraries(Config.extLibs, Config.defaultLibs)
-    if (currentLibs.isEmpty) {
+    val newLibs = loadLibraries(Config.extLibs, Config.defaultLibs)
+    if (newLibs.values.forall(_.isEmpty)) {
       // schedule a periodic library update
       context.system.scheduler.scheduleOnce(5.seconds, context.self, RefreshLibraries)
+
+    } else {
+      // libs loaded
+      currentLibs = newLibs
+      // setup next refresh
+      context.system.scheduler.scheduleOnce(Config.refreshLibraries, context.self, RefreshLibraries)
     }
   }
 
@@ -61,22 +67,27 @@ class CompilerManager extends Actor with ActorLogging {
             val data = if (uri.startsWith("file:")) {
               // load from file system
               scala.io.Source.fromFile(uri.drop(5), "UTF-8").mkString
+
             } else if (uri.startsWith("http")) {
               // load from internet
               System.setProperty(
                 "http.agent",
                 "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/28.0.1500.29 Safari/537.36")
               scala.io.Source.fromURL(uri, "UTF-8").mkString
+
             } else {
               // load from resources
               scala.io.Source.fromInputStream(getClass.getResourceAsStream(uri), "UTF-8").mkString
             }
+
             val extLibs = read[Seq[String]](data)
+            // tie loaded libs together with default libs
             (extLibs ++ versionLibs).map(ExtLib(_))
+
           } catch {
             case e: Throwable =>
-              log.error(e, s"Unable to load external libraries, only using default ones.")
-              versionLibs.map(ExtLib(_))
+              log.error(e, s"Unable to load external libraries")
+              Nil
           }
         case _ =>
           Nil
@@ -103,7 +114,8 @@ class CompilerManager extends Actor with ActorLogging {
 
     log.debug(s"Selecting compiler for Scala $scalaVersion and libs $libs")
     // check that all libs are supported
-    val versionLibs = currentLibs.getOrElse(scalaVersion, Vector.empty)
+    val versionLibs =
+      currentLibs.getOrElse(scalaVersion, Config.defaultLibs.getOrElse(scalaVersion, Seq.empty).map(ExtLib(_)))
     log.debug(s"Libraries:\n$versionLibs")
     libs.foreach(lib => if (!versionLibs.contains(lib)) throw new IllegalArgumentException(s"Library $lib is not supported"))
     // select the best available compiler server based on:
@@ -171,7 +183,9 @@ class CompilerManager extends Actor with ActorLogging {
                                       now)
       log.debug(s"Registered compiler $id for Scala $scalaVersion")
       // send current libraries
-      compilerService ! UpdateLibraries(currentLibs.getOrElse(scalaVersion, Nil))
+      compilerService ! UpdateLibraries(
+        currentLibs.getOrElse(scalaVersion, Config.defaultLibs.getOrElse(scalaVersion, Seq.empty).map(ExtLib(_)))
+      )
       context.watch(compilerService)
 
     case UnregisterCompiler(id) =>
@@ -221,8 +235,9 @@ class CompilerManager extends Actor with ActorLogging {
       try {
         log.debug("Refreshing libraries")
         val newLibs = loadLibraries(Config.extLibs, Config.defaultLibs)
+
         // are there any changes?
-        if (newLibs.nonEmpty && newLibs.toSet != currentLibs.toSet) {
+        if (newLibs.values.exists(_.nonEmpty) && newLibs.toSet != currentLibs.toSet) {
           currentLibs = newLibs
           // inform all connected compilers
           compilers.values.foreach { comp =>
@@ -230,10 +245,12 @@ class CompilerManager extends Actor with ActorLogging {
           }
           // refresh again
           context.system.scheduler.scheduleOnce(Config.refreshLibraries, context.self, RefreshLibraries)
-        } else if (newLibs.isEmpty) {
+
+        } else /*if (newLibs.values.forall(_.isEmpty))*/ {
           // try again soon
           context.system.scheduler.scheduleOnce(5.seconds, context.self, RefreshLibraries)
         }
+
       } catch {
         case e: Throwable =>
           log.error(s"Error while refreshing libraries", e)
